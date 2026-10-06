@@ -1,0 +1,120 @@
+cd /home/hl/stkim_ws/openpi
+
+export PYTHONNOUSERSITE=1
+export OPENPI_DATA_HOME="$PWD/.openpi_cache"
+export HF_HUB_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+export WANDB_MODE=disabled
+export XLA_PYTHON_CLIENT_PREALLOCATE=false
+
+uv run --offline python - <<'PY'
+import dataclasses
+import importlib.util
+from datetime import datetime
+from pathlib import Path
+
+import flax.nnx as nnx
+
+from openpi.models import gemma, siglip
+from openpi.training import config, weight_loaders
+
+
+# 기존 데이터·정규화·변환 설정을 그대로 가져옵니다.
+base = config.get_config(
+    "pi05_projection_60d_multi"
+)
+
+# 설치된 코드가 작은 Gemma를 지원하는지 먼저 확인합니다.
+gemma.get_config("dummy")
+
+# Gemma만 줄이면 이미지 인코더는 여전히 400M입니다.
+# 이번 프로세스에서만 작은 이미지 인코더로 교체합니다.
+# 원본 pi0.py / siglip.py 파일은 수정하지 않습니다.
+original_decode_variant = siglip.decode_variant
+
+def smoke_decode_variant(variant):
+    if variant == "So400m/14":
+        return original_decode_variant("mu/14")
+    return original_decode_variant(variant)
+
+siglip.decode_variant = smoke_decode_variant
+
+
+# config 이름을 바꿔도 기존 norm stats 경로를 유지합니다.
+data = dataclasses.replace(
+    base.data,
+    assets=dataclasses.replace(
+        base.data.assets,
+        assets_dir=(
+            base.data.assets.assets_dir
+            or str(base.assets_dirs)
+        ),
+    ),
+)
+
+# 모델 크기만 줄입니다.
+# action dimension, horizon, tokenizer 설정은 유지합니다.
+model = dataclasses.replace(
+    base.model,
+    pi05=True,
+    action_dim=60,
+    paligemma_variant="dummy",
+    action_expert_variant="dummy",
+)
+
+smoke = dataclasses.replace(
+    base,
+    name="pi05_training_smoke",
+    exp_name=datetime.now().strftime(
+        "smoke_%Y%m%d_%H%M%S"
+    ),
+    model=model,
+    data=data,
+
+    # 작은 모델은 원본 체크포인트와 크기가 다릅니다.
+    # pretrained weights를 읽지 않고 랜덤 초기화합니다.
+    weight_loader=weight_loaders.NoOpWeightLoader(),
+
+    # projection만이 아니라 모든 파라미터를 업데이트합니다.
+    freeze_filter=nnx.Nothing,
+    ema_decay=None,
+
+    batch_size=1,
+    num_workers=0,
+    fsdp_devices=1,
+    num_train_steps=3,
+    log_interval=1,
+    save_interval=1,
+    keep_period=None,
+
+    wandb_enabled=False,
+    resume=False,
+    overwrite=False,
+)
+
+# 이전에 추가한 early stopping이 있으면 짧은 검사에서 끕니다.
+if hasattr(smoke, "early_stopping"):
+    smoke = dataclasses.replace(
+        smoke,
+        early_stopping=False,
+    )
+
+# 별도의 테스트 학습 루프가 아니라,
+# 현재 로컬 scripts/train.py의 main을 직접 실행합니다.
+train_path = Path("scripts/train.py").resolve()
+spec = importlib.util.spec_from_file_location(
+    "local_training_smoke",
+    train_path,
+)
+train = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(train)
+
+print("Checkpoint directory:", smoke.checkpoint_dir)
+print("Starting actual train.py with a small model...")
+
+train.main(smoke)
+
+print("\nTRAINING SMOKE TEST COMPLETED")
+print("Checkpoint directory:", smoke.checkpoint_dir)
+PY
